@@ -24,8 +24,10 @@ class VoiceState:
         self.running         = False
         self.is_recording    = False
         self.is_speaking     = False  # Lumi parle → micro off
-        self.lumi_mode       = False
-        self.last_transcript = ""
+        self.lumi_mode            = False
+        self.last_transcript      = ""
+        self.last_lumi_activity   = 0.0   # timestamp dernière question en mode Lumi
+        self.thread_id            = None  # ID du thread actif
         self.session_theme   = "général"
         self.alert           = ""
         self.transcript_log  = []
@@ -72,21 +74,37 @@ def play_tts(text: str):
         finally:
             with voice_state.lock:
                 voice_state.is_speaking = False
+                # Reset le timer inactivité après que Lumi finit de parler
+                if voice_state.lumi_mode:
+                    voice_state.last_lumi_activity = time.time()
             if tmp:
                 try: os.unlink(tmp)
                 except: pass
     threading.Thread(target=_run, daemon=True).start()
 
 def start_listening():
-    with voice_state.lock:
-        if voice_state.running:
+    # Vérifier si un thread "lumi-voice-loop" est déjà vivant dans ce process
+    for t in threading.enumerate():
+        if t.name == "lumi-voice-loop" and t.is_alive():
+            print(f"[VOICE] Thread déjà vivant (id={t.ident}), skip", flush=True)
+            with voice_state.lock:
+                voice_state.running = True
+                voice_state.thread_id = t.ident
             return
+
+    with voice_state.lock:
         voice_state.running = True
-    threading.Thread(target=_loop, daemon=True).start()
+
+    t = threading.Thread(target=_loop, daemon=True, name="lumi-voice-loop")
+    t.start()
+    with voice_state.lock:
+        voice_state.thread_id = t.ident
+    print(f"[VOICE] Nouveau thread démarré (id={t.ident})", flush=True)
 
 def stop_listening():
     with voice_state.lock:
         voice_state.running = False
+        voice_state.thread_id = None
 
 _HALLUCINATIONS = [
     "thank you for watching", "thanks for watching",
@@ -104,11 +122,34 @@ def _loop():
     SAMPLERATE = 16000
     DURATION   = 10  # secondes
 
+    LUMI_IDLE_TIMEOUT = 30.0  # secondes avant message d'au revoir
+
     while True:
         with voice_state.lock:
             if not voice_state.running:
                 break
-            speaking = voice_state.is_speaking
+            speaking      = voice_state.is_speaking
+            lumi_active   = voice_state.lumi_mode
+            last_activity = voice_state.last_lumi_activity
+
+        # Timeout inactivité Lumi — seulement si pas en train d'enregistrer/parler
+        with voice_state.lock:
+            is_rec  = voice_state.is_recording
+            is_spk  = voice_state.is_speaking
+        if lumi_active and last_activity > 0 and not is_rec and not is_spk:
+            idle = time.time() - last_activity
+            if idle > LUMI_IDLE_TIMEOUT:
+                with voice_state.lock:
+                    voice_state.lumi_mode = False
+                    voice_state.last_lumi_activity = 0.0
+                import random
+                BYE_MSGS = [
+                    "Je vois que t'as plus besoin de moi, à tout à l'heure !",
+                    "Ok je te laisse travailler, appelle-moi si t'as besoin !",
+                    "Je disparais, dis Lumi quand tu veux me parler !",
+                    "Je vois que t'es concentré, je te laisse !",
+                ]
+                play_tts(random.choice(BYE_MSGS))
 
         if speaking:
             time.sleep(0.3)
@@ -162,6 +203,16 @@ def _transcribe(path: str):
 
         if not text:
             return
+        # Rejeter les transcriptions trop courtes (< 3 mots = hallucination)
+        words = [w for w in text.strip().split() if len(w) > 1]
+        if len(words) < 2:
+            print(f"[VOICE] Rejeté (trop court): '{text}'", flush=True)
+            return
+        # Rejeter si trop de lettres isolées (ex: "U S H E")
+        single_letters = sum(1 for w in text.strip().split() if len(w) == 1)
+        if single_letters >= 3:
+            print(f"[VOICE] Rejeté (lettres isolées): '{text}'", flush=True)
+            return
         if any(h in text.lower() for h in _HALLUCINATIONS):
             return
 
@@ -190,6 +241,7 @@ def _transcribe(path: str):
         if any(w in tl for w in _WAKE):
             with voice_state.lock:
                 voice_state.lumi_mode = True
+                voice_state.last_lumi_activity = time.time()
             # Extrait la question après "Lumi"
             clean = tl
             for w in _WAKE:
@@ -205,6 +257,8 @@ def _transcribe(path: str):
         with voice_state.lock:
             active = voice_state.lumi_mode
         if active and _on_lumi_question:
+            with voice_state.lock:
+                voice_state.last_lumi_activity = time.time()
             _on_lumi_question(text)
 
         # Log transcription passive
@@ -226,16 +280,17 @@ def set_session_theme(theme: str):
 def get_status() -> dict:
     with voice_state.lock:
         return {
-            "running":         voice_state.running,
-            "is_recording":    voice_state.is_recording,
-            "is_speaking":     voice_state.is_speaking,
-            "last_transcript": voice_state.last_transcript,
-            "lumi_mode":       voice_state.lumi_mode,
-            "session_theme":   voice_state.session_theme,
-            "alert":           voice_state.alert,
-            "transcript_log":  list(voice_state.transcript_log[-10:]),
-            "last_theme":      "",
-            "is_on_topic":     True,
+            "running":           voice_state.running,
+            "is_recording":      voice_state.is_recording,
+            "is_speaking":       voice_state.is_speaking,
+            "last_transcript":   voice_state.last_transcript,
+            "lumi_mode":         voice_state.lumi_mode,
+            "session_theme":     voice_state.session_theme,
+            "alert":             voice_state.alert,
+            "transcript_log":    list(voice_state.transcript_log[-10:]),
+            "last_theme":        "",
+            "is_on_topic":       True,
+            "last_lumi_activity": voice_state.last_lumi_activity,
         }
 
 _play_tts = play_tts

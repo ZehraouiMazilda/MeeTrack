@@ -11,7 +11,9 @@ from database import (
     add_source, get_sources, delete_source,
     add_note, get_notes, delete_note,
     add_chat_message, get_chat_messages,
-    add_transcript,
+    add_transcript, add_distraction,
+    add_timeline_point, init_session_stats,
+    increment_alert_stat, finalize_session_stats,
 )
 from services.vision import process_frame, shared_state, start_calibration
 from services.concentration_engine import engine
@@ -105,6 +107,7 @@ def _setup_voice(sid: int, title: str, src_content: str):
             add_chat_message(sid, "user", text)
             add_chat_message(sid, "assistant", reply)
             add_transcript(sid, text, mode="lumi")
+            increment_alert_stat(sid, "lumi_call")
             print(f"[CHAT SAVED] Q: {text[:40]} | A: {reply[:40]}", flush=True)
             play_tts(reply)
         except Exception as e:
@@ -138,11 +141,14 @@ def show():
     if not st.session_state.get("session_id"):
         title = st.session_state.get("new_session_title", "Nouvelle session")
         sid   = create_session(title)
+        init_session_stats(sid)
         st.session_state.update({
             "session_id": sid, "session_title": title,
             "session_start": time.time(), "summary_done": False,
             "open_source": None, "voice_started": False,
             "_last_msg_count": 0,
+            "_last_snapshot": time.time(),
+            "_lumi_calls": 0,
         })
 
     sid     = st.session_state["session_id"]
@@ -164,10 +170,14 @@ def show():
         st.markdown(f'<div style="text-align:center;line-height:1.3;"><div style="font-size:1rem;font-weight:700;color:#f0eaff;">{title}</div><div style="font-size:1.7rem;font-weight:800;color:#9b6dff;">{_fmt_time(elapsed)}</div></div>', unsafe_allow_html=True)
     with h3:
         if st.button("🚪 Quitter", use_container_width=True, key="quit_btn"):
+            # Résumé auto pour les stats
+            summary = _groq_summary(src_content, title) if src_content else ""
             update_session(sid, duration_sec=elapsed)
+            finalize_session_stats(sid, summary=summary)
             stop_listening()
             for k in ["session_id","session_title","session_start","summary_done",
-                      "open_source","voice_started","new_session_title","_last_msg_count"]:
+                      "open_source","voice_started","new_session_title","_last_msg_count",
+                      "_last_snapshot","_lumi_calls"]:
                 st.session_state.pop(k, None)
             st.session_state["page"] = "home"
             st.rerun()
@@ -240,7 +250,19 @@ def show():
             lumi_on = vs.get("lumi_mode", False)
             st.markdown(f'<div style="background:{"#3d1f4a" if lumi_on else "#2d2040"};border:1.5px solid {"#9b6dff" if lumi_on else "#4a3560"};border-radius:10px;padding:7px 12px;font-size:0.8rem;color:#f0eaff;margin-top:8px;">{"🎤 Mode Lumi actif — dis <b>merci Lumi</b> pour terminer" if lumi_on else "💡 Dis <b style=color:#9b6dff>Lumi</b> pour me parler"}</div>', unsafe_allow_html=True)
             if cam_alert:
-                st.error(cam_alert)
+                # Alerte auto-disparition via JS
+                st.markdown(f"""
+                <div id="cam-alert" style="background:#3d0f0f;border:1.5px solid #ef4444;
+                     border-radius:10px;padding:8px 14px;font-size:0.82rem;color:#fca5a5;
+                     margin-top:8px;">
+                    {cam_alert}
+                </div>
+                <script>
+                setTimeout(function(){{
+                    var el = document.getElementById('cam-alert');
+                    if(el) el.style.display='none';
+                }}, 5000);
+                </script>""", unsafe_allow_html=True)
 
     # ── DEBUG ────────────────────────────────────────────────
     vs = vd_status()
@@ -324,6 +346,29 @@ def show():
                         reply = _groq_chat(h, src_content, title)
                     add_chat_message(sid, "assistant", reply)
                     st.rerun()
+
+    # ── SNAPSHOT concentration toutes les 30s ────────────────
+    now = time.time()
+    if now - st.session_state.get("_last_snapshot", 0) >= 30:
+        st.session_state["_last_snapshot"] = now
+        with shared_state.lock:
+            snap_score  = shared_state.score
+            snap_ear    = shared_state.ear
+            snap_yaw    = shared_state.yaw
+            snap_pitch  = shared_state.pitch
+            snap_alert  = shared_state.alert_type
+        vs_snap = vd_status()
+        engine_status = engine.get_status()
+        add_timeline_point(
+            sid, elapsed,
+            score_global   = engine.compute_final(snap_score),
+            score_camera   = snap_score,
+            score_behavior = engine_status.get("behavior_score", 100),
+            ear=snap_ear, yaw=snap_yaw, pitch=snap_pitch,
+            lumi_mode=vs_snap.get("lumi_mode", False)
+        )
+        if snap_alert:
+            increment_alert_stat(sid, snap_alert)
 
     # ── POLLING : refresh si nouveaux messages vocaux ────────
     current_count = len(get_chat_messages(sid))

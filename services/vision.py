@@ -32,10 +32,10 @@ CHIN         = 152
 FOREHEAD     = 10
 
 # ── Seuils fixes (overridés par calibration) ──────────────────
-YAW_THRESHOLD      = 28.0
-PITCH_UP_THRESHOLD = 20.0
-ALERT_DELAY        = 10.0
-ALERT_COOLDOWN     = 30.0
+YAW_THRESHOLD      = 35.0
+PITCH_UP_THRESHOLD = 30.0
+ALERT_DELAY        = 15.0
+ALERT_COOLDOWN     = 45.0
 BLINK_MIN_DURATION = 0.08   # secondes — en dessous = clignement normal
 BLINK_MAX_DURATION = 0.40   # au dessus = yeux vraiment fermés
 YAWN_MAR_THRESHOLD = 0.55   # MAR au dessus = bâillement
@@ -87,23 +87,21 @@ shared_state = ConcentrationState()
 
 # ── Son ───────────────────────────────────────────────────────
 def _play_alert(message: str):
-    def _run():
-        try:
-            from gtts import gTTS
-            from playsound import playsound
-            tts  = gTTS(text=message, lang='fr', slow=False)
-            path = "alert_sound.mp3"
-            tts.save(path)
-            playsound(path)
-        except Exception:
+    """Délègue le TTS au voice_detector — bloqué si Lumi est en mode actif."""
+    try:
+        from services.voice_detector import play_tts, get_status
+        vs = get_status()
+        # Bloquer seulement si Lumi parle activement (pas pendant mode actif)
+        if vs.get("is_speaking"):
+            return
+        play_tts(message)
+    except Exception:
+        def _beep():
             try:
                 import winsound
-                winsound.Beep(880, 600)
-                time.sleep(0.1)
-                winsound.Beep(880, 600)
-            except Exception:
-                pass
-    threading.Thread(target=_run, daemon=True).start()
+                winsound.Beep(880, 300)
+            except: pass
+        threading.Thread(target=_beep, daemon=True).start()
 
 
 def _trigger_alert(msg: str, atype: str):
@@ -186,7 +184,7 @@ def _head_pose(lms, w, h):
     else:
         raw = 0.0
     face_mid_y = (forehead[1] + chin[1]) / 2
-    pitch = float(raw if nose[1] < face_mid_y else -raw)
+    pitch = float(-raw if nose[1] < face_mid_y else raw)  # positif = tête levée, négatif = tête baissée
     return yaw, pitch
 
 
@@ -218,13 +216,11 @@ def _compute_score(ear_v, yaw_v, pitch_v, face_ok, ear_thresh, ear_nat):
     else:
         yaw_score = 0
 
-    # Pitch (20 pts)
-    if pitch_v <= 0:
-        pitch_score = 20          # regarde en bas = prend des notes → plein
-    elif pitch_v <= 10:
-        pitch_score = 20
+    # Pitch (20 pts) — négatif = tête baissée (notes) = bien, positif = tête levée = mal
+    if pitch_v <= 15:
+        pitch_score = 20          # position normale à légèrement levée → plein
     elif pitch_v <= PITCH_UP_THRESHOLD:
-        pitch_score = int(20 * (1 - (pitch_v - 10) / (PITCH_UP_THRESHOLD - 10)))
+        pitch_score = int(20 * (1 - (pitch_v - 15) / (PITCH_UP_THRESHOLD - 15)))
     else:
         pitch_score = 0
 
@@ -273,7 +269,16 @@ def process_frame(img: np.ndarray) -> np.ndarray:
             shared_state._pitch_up_since   = None
 
         if elapsed > ALERT_DELAY:
-            _trigger_alert(f"Hé ! Tu n'es plus là depuis {int(elapsed)} secondes !", "no_face")
+            import random
+            NO_FACE_MSGS = [
+                "T'es devenu Casper ou quoi ?",
+                f"Où t'es passé depuis {int(elapsed)} secondes ? Y'a plus personne !",
+                "La caméra te cherche... t'as disparu comme mes chances de réussir !",
+                "Reviens ! La caméra se sent seule !",
+                "T'es parti faire un tour ? Tes cours t'attendent !",
+                "Signal perdu, t'es en mode fantôme ?",
+            ]
+            _trigger_alert(random.choice(NO_FACE_MSGS), "no_face")
 
         cv2.rectangle(img, (0, 0), (w, 52), (15, 15, 30), -1)
         cv2.putText(img, "Aucun visage detecte", (12, 34),
@@ -352,13 +357,7 @@ def process_frame(img: np.ndarray) -> np.ndarray:
         shared_state.mar         = round(mar_v, 3)
         shared_state.is_speaking = 0.15 < mar_v < YAWN_MAR_THRESHOLD
 
-    # Notifie le voice detector si bouche en mouvement
-    if not is_yawning:
-        try:
-            from services.voice_detector import notify_mouth_moving
-            notify_mouth_moving(mar_v)
-        except Exception:
-            pass
+    # (notify_mouth_moving supprimé — non utilisé)
 
     # ── Score ──────────────────────────────────────────────────
     # Pénalité si yeux vraiment fermés > 400ms (pas juste un clignement)
@@ -374,13 +373,13 @@ def process_frame(img: np.ndarray) -> np.ndarray:
     alert_type = ""
 
     # Yeux fermés > 5s (pas un clignement)
-    if eye_closed_dur > 5.0:
+    if eye_closed_dur > 8.0:
         alert_msg  = f"Tu dors ? Yeux fermés depuis {int(eye_closed_dur)} secondes !"
         alert_type = "eyes"
 
     # Bâillement
     if is_yawning and not alert_msg:
-        alert_msg  = "Bâillement détecté — tu fatigues, fais une pause !"
+        alert_msg  = "Bâillement détecté, tu fatigues, fais une pause !"
         alert_type = "yawn"
 
     # Tête tournée > 10s
@@ -388,14 +387,14 @@ def process_frame(img: np.ndarray) -> np.ndarray:
         if shared_state._yaw_since is None:
             shared_state._yaw_since = now
         elapsed_y = now - shared_state._yaw_since
-        if elapsed_y > ALERT_DELAY and not alert_msg:
+        if elapsed_y > 20.0 and not alert_msg:
             d          = "droite" if yaw_v > 0 else "gauche"
             alert_msg  = f"Hé ! Concentre-toi, tu regardes à {d} !"
             alert_type = "yaw"
     else:
         shared_state._yaw_since = None
 
-    # Tête levée > 10s
+    # Tête levée > 10s (pitch positif élevé = regarde vraiment en haut)
     if pitch_v > PITCH_UP_THRESHOLD:
         if shared_state._pitch_up_since is None:
             shared_state._pitch_up_since = now
@@ -416,8 +415,9 @@ def process_frame(img: np.ndarray) -> np.ndarray:
         shared_state.yaw            = round(yaw_v, 1)
         shared_state.pitch          = round(pitch_v, 1)
         shared_state.score          = smoothed
+        # Popup disparaît automatiquement si plus d'alerte
         shared_state.alert          = f"🚨 {alert_msg}" if alert_msg else ""
-        shared_state.alert_type     = alert_type
+        shared_state.alert_type     = alert_type if alert_msg else ""
         shared_state._no_face_since = None
 
     # ── Dessin ────────────────────────────────────────────────
