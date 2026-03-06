@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  lumi:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lumi-app
+    restart: unless-stopped
+
+    # ── Variables d'environnement ──────────────────────────────
+    env_file:
+      - .env
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - DB_PATH=/app/data/lumi.db
+
+    # ── Ports ─────────────────────────────────────────────────
+    ports:
+      - "8501:8501"
+
+    # ── Volume pour la base de données SQLite ─────────────────
+    volumes:
+      - lumi-data:/app/data
+
+    # ── Accès audio (micro / TTS) ─────────────────────────────
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
+
+    # ── Healthcheck ───────────────────────────────────────────
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+# ── Volume persistant ──────────────────────────────────────────
+volumes:
+  lumi-data:
+    driver: local

@@ -1,9 +1,11 @@
 import sqlite3
 import json
 import bcrypt
+import os
 from datetime import datetime
 
-DB_PATH = "lumi.db"
+import os
+DB_PATH = os.environ.get("DB_PATH", "lumi.db")
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)

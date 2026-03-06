@@ -1,0 +1,34 @@
+# Environnements virtuels
+lumi-env/
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Base de données locale (gérée par le volume Docker)
+*.db
+*.sqlite
+*.sqlite3
+
+# Variables d'environnement sensibles
+.env
+
+# Git
+.git/
+.gitignore
+
+# Docs et tests
+docs/
+test_*.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
